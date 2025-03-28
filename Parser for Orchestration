@@ -1,0 +1,305 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[3]:
+
+
+# Import required libraries
+import os  # For operating system dependent functionality
+import json  # For JSON processing
+import boto3  # AWS SDK for Python
+import pandas as pd  # For data manipulation and analysis
+import logging  # For logging functionality
+import tempfile  # For creating temporary files
+import time  # For adding delays in file operations
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError  # AWS specific exceptions
+from IPython.display import display, HTML  # For displaying DataFrames in Jupyter notebooks
+
+# Configure logging with timestamp, level, and message format
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Function to flatten nested JSON structures into a flat dictionary
+def flatten_json(y):
+    out = {}  # Initialize empty output dictionary
+
+    def flatten(x, name=''):
+        # Recursive function to flatten nested structures
+        if isinstance(x, dict):  # If the current object is a dictionary
+            for a in x:  # Iterate through all keys
+                flatten(x[a], name + a + '_')  # Recursively flatten with updated prefix
+        elif isinstance(x, list):  # If the current object is a list
+            i = 1  # Counter for list items
+            for a in x:  # Iterate through list items
+                flatten(a, name + str(i) + '_')  # Recursively flatten with index prefix
+                i += 1
+        else:  # If the current object is a primitive type
+            out[name[:-1]] = x  # Store value with its full path name (remove last underscore)
+
+    flatten(y)  # Start the flattening process
+    return out  # Return the flattened dictionary
+
+# Main class for processing various file types
+class JSONProcessor:
+    def __init__(self, directory=None, bucket_name=None):
+        """
+        Initialize the processor with either a local directory or S3 bucket
+        """
+        self.directory = directory  # Local directory path
+        self.bucket_name = bucket_name  # S3 bucket name
+        try:
+            # Initialize AWS S3 client with credentials
+            self.s3_client = boto3.client(
+                's3',
+                aws_access_key_id='*****************',
+                aws_secret_access_key='*********************',
+                region_name='us-east-1'
+            )
+            logging.info("S3 client initialized successfully")
+        except (NoCredentialsError, PartialCredentialsError) as e:
+            logging.error(f"Credentials error: {e}")
+            raise
+
+    def find_files(self):
+        """
+        Find all supported files in the specified directory or S3 bucket
+        """
+        # List of supported file extensions
+        supported_extensions = ['.json', '.ndjson', '.parquet', '.txt']
+        
+        try:
+            if self.directory:  # If working with local directory
+                # List all files with supported extensions
+                files = [os.path.join(self.directory, file) for file in os.listdir(self.directory) 
+                         if os.path.splitext(file)[1].lower() in supported_extensions]
+                logging.info(f"Found {len(files)} files in directory {self.directory}")
+            elif self.bucket_name:  # If working with S3 bucket
+                # List all files in the S3 bucket
+                objects = self.s3_client.list_objects_v2(Bucket=self.bucket_name)
+                # Filter files by supported extensions
+                files = [obj['Key'] for obj in objects.get('Contents', []) 
+                         if os.path.splitext(obj['Key'])[1].lower() in supported_extensions]
+                logging.info(f"Found {len(files)} files in S3 bucket {self.bucket_name}")
+            else:
+                raise ValueError("No directory or bucket name provided")
+            return files
+        except ClientError as e:
+            logging.error(f"Failed to list files: {e}")
+            raise
+        except Exception as e:
+            logging.error(f"Error finding files: {e}")
+            raise
+
+    def load_and_flatten_json(self, file_path):
+        """
+        Load and flatten JSON file into a pandas DataFrame
+        """
+        try:
+            if self.bucket_name:  # If reading from S3
+                # Get file content from S3 and decode it
+                file_content = self.s3_client.get_object(Bucket=self.bucket_name, Key=file_path)['Body'].read().decode('utf-8')
+                json_data = json.loads(file_content)
+            else:  # If reading from local file
+                with open(file_path, 'r') as file:
+                    json_data = json.load(file)
+            logging.info(f"Loaded JSON file: {file_path}")
+        except (ClientError, FileNotFoundError, json.JSONDecodeError) as e:
+            logging.error(f"Error loading JSON file: {file_path}, Error: {e}")
+            raise
+
+        try:
+            # Process the JSON data based on its structure
+            if isinstance(json_data, list):  # If root is a list
+                flattened_data = [flatten_json(item) for item in json_data]
+            elif isinstance(json_data, dict):  # If root is a dictionary
+                key = list(json_data.keys())[0]
+                flattened_data = [flatten_json(item) for item in json_data[key]]
+            else:
+                raise ValueError("Unsupported JSON format")
+            logging.info(f"Flattened JSON data from file: {file_path}")
+            return pd.DataFrame(flattened_data)
+        except Exception as e:
+            logging.error(f"Error flattening JSON data: {e}")
+            raise
+
+    def load_ndjson(self, file_path):
+        """
+        Load and process NDJSON (Newline Delimited JSON) file
+        """
+        try:
+            if self.bucket_name:  # If reading from S3
+                # Get file content and split into lines
+                file_content = self.s3_client.get_object(Bucket=self.bucket_name, Key=file_path)['Body'].read().decode('utf-8')
+                lines = file_content.splitlines()
+            else:  # If reading from local file
+                with open(file_path, 'r') as file:
+                    lines = file.readlines()
+            logging.info(f"Loaded NDJSON file: {file_path}")
+        except (ClientError, FileNotFoundError) as e:
+            logging.error(f"Error loading NDJSON file: {file_path}, Error: {e}")
+            raise
+
+        try:
+            # Parse each line as JSON and flatten
+            json_data = [json.loads(line) for line in lines]
+            flattened_data = [flatten_json(item) for item in json_data]
+            logging.info(f"Flattened NDJSON data from file: {file_path}")
+            return pd.DataFrame(flattened_data)
+        except (json.JSONDecodeError, Exception) as e:
+            logging.error(f"Error flattening NDJSON data: {e}")
+            raise
+
+    def load_parquet(self, file_path):
+        """
+        Load Parquet file with Windows-compatible handling
+        """
+        temp_file_path = None
+        
+        try:
+            if self.bucket_name:  # If reading from S3
+                # Create unique temporary file path
+                temp_file_path = os.path.join(tempfile.gettempdir(), 
+                                            f"parquet_temp_{os.getpid()}_{hash(file_path)}.parquet")
+                
+                # Download file from S3 to temporary location
+                logging.info(f"Downloading Parquet file to temporary location: {temp_file_path}")
+                self.s3_client.download_file(self.bucket_name, file_path, temp_file_path)
+                logging.info(f"Downloaded Parquet file: {file_path}")
+                
+                # Read the parquet file
+                df = pd.read_parquet(temp_file_path)
+                logging.info(f"Loaded Parquet file into DataFrame: {file_path}")
+                
+                return df
+                
+            else:  # If reading from local file
+                df = pd.read_parquet(file_path)
+                logging.info(f"Loaded Parquet file from local storage: {file_path}")
+                return df
+                
+        except Exception as e:
+            logging.error(f"Error loading Parquet file: {file_path}, Error: {e}")
+            raise
+            
+        finally:
+            # Cleanup temporary file
+            if temp_file_path and os.path.exists(temp_file_path):
+                try:
+                    # Add delay to ensure file handle is released (Windows compatibility)
+                    time.sleep(0.1)  # 100ms delay
+                    
+                    os.unlink(temp_file_path)
+                    logging.info(f"Temporary file removed: {temp_file_path}")
+                except Exception as cleanup_error:
+                    logging.warning(f"Failed to remove temporary file {temp_file_path}: {cleanup_error}")
+
+    def load_tab_delimited_txt(self, file_path):
+        """
+        Load tab-delimited text file into DataFrame
+        """
+        try:
+            if self.bucket_name:  # If reading from S3
+                # Get file content and read as tab-delimited
+                file_content = self.s3_client.get_object(Bucket=self.bucket_name, Key=file_path)['Body']
+                df = pd.read_csv(file_content, sep='\t')
+                logging.info(f"Loaded tab-delimited TXT file: {file_path}")
+            else:  # If reading from local file
+                df = pd.read_csv(file_path, sep='\t')
+                logging.info(f"Loaded tab-delimited TXT file from local storage: {file_path}")
+            return df
+        except (ClientError, FileNotFoundError, pd.errors.ParserError) as e:
+            logging.error(f"Error loading tab-delimited TXT file: {file_path}, Error: {e}")
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error in loading tab-delimited TXT: {e}")
+            raise
+
+    def process_file(self, file_path):
+        """
+        Process file based on its extension
+        """
+        # Get file extension in lowercase
+        file_extension = os.path.splitext(file_path)[1].lower()
+
+        try:
+            # Route to appropriate processing method based on file extension
+            if file_extension == '.json':
+                df = self.load_and_flatten_json(file_path)
+            elif file_extension == '.ndjson':
+                df = self.load_ndjson(file_path)
+            elif file_extension == '.parquet':
+                df = self.load_parquet(file_path)
+            elif file_extension == '.txt':
+                df = self.load_tab_delimited_txt(file_path)
+            else:
+                raise ValueError("Unsupported file format")
+            logging.info(f"Processed file: {file_path}")
+            return df
+        except ValueError as e:
+            logging.error(f"Unsupported file format: {file_path}, Error: {e}")
+            raise
+        except Exception as e:
+            logging.error(f"Error processing file: {file_path}, Error: {e}")
+            raise
+
+    def save_to_csv(self, df, file_path):
+        """
+        Save DataFrame to CSV file
+        """
+        try:
+            # Create CSV file path by changing extension to .csv
+            csv_file_path = os.path.splitext(file_path)[0] + '.csv'
+            df.to_csv(csv_file_path, index=False)
+            logging.info(f"CSV file saved to {csv_file_path}")
+            return csv_file_path
+        except Exception as e:
+            logging.error(f"Error saving CSV file: {file_path}, Error: {e}")
+            raise
+
+    def upload_to_s3(self, local_file_path, s3_key):
+        """
+        Upload local file to S3 bucket
+        """
+        try:
+            # Upload file to S3
+            self.s3_client.upload_file(local_file_path, self.bucket_name, s3_key)
+            logging.info(f"File {local_file_path} uploaded to S3 bucket {self.bucket_name} as {s3_key}")
+        except ClientError as e:
+            logging.error(f"Error uploading file to S3: {local_file_path}, Error: {e}")
+            raise
+
+# Main execution block
+if __name__ == "__main__":
+    # Set target S3 bucket
+    bucket_name = "data-transformation-bucket"
+    # Initialize processor
+    processor = JSONProcessor(bucket_name=bucket_name)
+
+    try:
+        # Get list of files to process
+        files = processor.find_files()
+
+        # Process each file
+        for file_path in files:
+            # Load and process the file
+            df = processor.process_file(file_path)
+            # Save to CSV
+            local_csv_path = processor.save_to_csv(df, file_path)
+            # Prepare S3 key for CSV file
+            s3_csv_key = os.path.splitext(file_path)[0] + '.csv'
+            # Upload CSV to S3
+            processor.upload_to_s3(local_csv_path, s3_csv_key)
+
+            # Display results in Jupyter notebook
+            display(HTML(f"<h2>Data from file: {os.path.basename(file_path)}</h2>"))
+            display(HTML(df.head(10).to_html(index=False)))
+
+    except Exception as e:
+        # Log any errors in the main processing pipeline
+        logging.error(f"Error in processing pipeline: {e}")
+
+
+# In[ ]:
+
+
+
+
